@@ -49,9 +49,10 @@
 static FILE *open_temp_cache_file (const char  *dir,
                                    char       **filename,
                                    GError     **error);
-static void add_mime_type (const char *mime_type, GList *desktop_files, FILE *f);
+static void add_key (const char *mime_type, GList *desktop_files, FILE *f);
 static void sync_database (const char *dir, GError **error);
-static void cache_desktop_file (const char  *desktop_file,
+static void cache_desktop_file (GHashTable* map,
+                                const char  *desktop_file,
                                 const char  *mime_type,
                                 GError     **error);
 static void process_desktop_file (const char  *desktop_file,
@@ -65,6 +66,7 @@ static const char ** get_default_search_path (void);
 static void print_desktop_dirs (const char **dirs);
 
 static GHashTable *mime_types_map = NULL;
+static GHashTable *categories_map = NULL;
 static gboolean verbose = FALSE, quiet = FALSE;
 
 static void
@@ -75,13 +77,14 @@ list_free_deep (gpointer key, GList *l, gpointer data)
 }
 
 static void
-cache_desktop_file (const char  *desktop_file,
-                    const char  *mime_type,
+cache_desktop_file (GHashTable* map,
+                    const char  *desktop_file,
+                    const char  *key,
                     GError     **error)
 {
   GList *desktop_files;
 
-  desktop_files = (GList *) g_hash_table_lookup (mime_types_map, mime_type);
+  desktop_files = (GList *) g_hash_table_lookup (map, key);
 
   /* do not add twice a desktop file mentioning the mime type more than once
    * (no need to use g_list_find() because we cache all mime types registered
@@ -91,9 +94,8 @@ cache_desktop_file (const char  *desktop_file,
     return;
 
   desktop_files = g_list_prepend (desktop_files, g_strdup (desktop_file));
-  g_hash_table_insert (mime_types_map, g_strdup (mime_type), desktop_files);
+  g_hash_table_insert (map, g_strdup (key), desktop_files);
 }
-
 
 static void
 process_desktop_file (const char  *desktop_file,
@@ -103,6 +105,7 @@ process_desktop_file (const char  *desktop_file,
   GError *load_error;
   GKeyFile *keyfile;
   char **mime_types;
+  char **categories;
   int i;
 
   keyfile = g_key_file_new ();
@@ -127,14 +130,22 @@ process_desktop_file (const char  *desktop_file,
   mime_types = g_key_file_get_string_list (keyfile,
                                            GROUP_DESKTOP_ENTRY,
                                            "MimeType", NULL, &load_error);
-
-  g_key_file_free (keyfile);
-
   if (load_error != NULL)
     {
       g_propagate_error (error, load_error);
       return;
     }
+
+  categories = g_key_file_get_string_list (keyfile,
+                                           GROUP_DESKTOP_ENTRY,
+                                           "Categories", NULL, &load_error);
+  if (load_error != NULL)
+    {
+      g_propagate_error (error, load_error);
+      return;
+    }
+
+  g_key_file_free (keyfile);
 
   for (i = 0; mime_types[i] != NULL; i++)
     {
@@ -165,7 +176,7 @@ process_desktop_file (const char  *desktop_file,
           g_assert_not_reached ();
       }
 
-      cache_desktop_file (name, mime_type, &load_error);
+      cache_desktop_file (mime_types_map, name, mime_type, &load_error);
 
       if (load_error != NULL)
         {
@@ -175,6 +186,20 @@ process_desktop_file (const char  *desktop_file,
         }
     }
   g_strfreev (mime_types);
+
+  for (i = 0; categories[i] != NULL; i++)
+    {
+      char *category;
+      category = g_strchomp (categories[i]);
+      cache_desktop_file (categories_map, name, category, &load_error);
+      if (load_error != NULL)
+        {
+          g_propagate_error (error, load_error);
+          g_strfreev (categories);
+          return;
+        }
+    }
+  g_strfreev (categories);
 }
 
 static void
@@ -300,7 +325,7 @@ open_temp_cache_file (const char *dir, char **filename, GError **error)
 }
 
 static void
-add_mime_type (const char *mime_type, GList *desktop_files, FILE *f)
+add_key (const char *mime_type, GList *desktop_files, FILE *f)
 {
   GString *list;
   GList *desktop_file;
@@ -345,11 +370,24 @@ sync_database (const char *dir, GError **error)
   keys = g_list_sort (keys, (GCompareFunc) g_strcmp0);
 
   for (key = keys; key != NULL; key = key->next)
-    add_mime_type (key->data,
+    add_key (key->data,
                    g_hash_table_lookup (mime_types_map, key->data),
                    tmp_file);
 
   g_list_free (keys);
+
+  fputs ("\n[Category Cache]\n", tmp_file);
+
+  keys = g_hash_table_get_keys (categories_map);
+  keys = g_list_sort (keys, (GCompareFunc) g_strcmp0);
+
+  for (key = keys; key != NULL; key = key->next)
+    add_key (key->data,
+                   g_hash_table_lookup (categories_map, key->data),
+                   tmp_file);
+
+  g_list_free (keys);
+
   fclose (tmp_file);
 
   cache_file = g_build_filename (dir, CACHE_FILENAME, NULL);
@@ -375,7 +413,9 @@ update_database (const char  *desktop_dir,
   mime_types_map = g_hash_table_new_full (g_str_hash, g_str_equal,
                                           (GDestroyNotify)g_free,
                                           NULL);
-
+  categories_map = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                          (GDestroyNotify)g_free,
+                                          NULL);
   update_error = NULL;
   process_desktop_files (desktop_dir, "", &update_error);
 
@@ -389,6 +429,9 @@ update_database (const char  *desktop_dir,
     }
   g_hash_table_foreach (mime_types_map, (GHFunc) list_free_deep, NULL);
   g_hash_table_destroy (mime_types_map);
+
+  g_hash_table_foreach (categories_map, (GHFunc) list_free_deep, NULL);
+  g_hash_table_destroy (categories_map);
 }
 
 static const char **
